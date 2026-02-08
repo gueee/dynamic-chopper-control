@@ -12,51 +12,64 @@ Wiz — GM TC (Günter Michaeller Technical Consulting), Saubersdorf, Austria. 3
 
 ## Current Status
 
-Architecture draft complete (see `docs/design.md`). No code exists yet. Kalico source verification is needed before Phase 1 implementation begins.
+**Phase 1 prototype implemented** in the Kalico fork (`gueee/kalico`, branch `feature/dynamic-chopper-control`). Architecture verified against actual Kalico source.
+
+## Repositories
+
+- **This repo** (`dynamic-chopper-control`) — docs, planning, example configs
+- **Kalico fork** (`gueee/kalico`, branch `feature/dynamic-chopper-control`) — actual implementation lives at `klippy/extras/dynamic_chopper.py`
 
 ## Build & Test
 
-No build system, test framework, or CI is configured yet. The project is pre-implementation.
+No build system or CI configured yet. To test:
+1. Copy `klippy/extras/dynamic_chopper.py` from the Kalico fork into a Kalico installation
+2. Add a `[dynamic_chopper stepper_x]` section to printer.cfg (see `config/dynamic_chopper.cfg`)
+3. Use `DYNAMIC_CHOPPER_STATUS STEPPER=stepper_x` to verify
 
-When Phase 1 begins:
-- Python prototype goes in `klippy/extras/dynamic_chopper.py`
-- C chelper code goes in `src/` (maps to `klippy/chelper/dcc.c` in Kalico)
-- Test macros go in `test/`
-- Example printer.cfg snippets go in `config/`
-
-## Architecture
+## Architecture (verified against Kalico source 2026-02-08)
 
 Three-layer design with **no MCU firmware changes**:
 
-1. **Klippy Python layer** — config parsing, profile management, `register_move_handler()` for move notifications
-2. **Chelper C layer** — reads `trapq` for velocity profiles, computes zone crossings, schedules timed SPI register writes (same level as `input_shaper.c`)
+1. **Klippy Python layer** — config parsing, profile management, hooks into `LookAheadQueue.add_move()` to intercept every kinematic move
+2. **Chelper C layer** (Phase 2) — reads `trapq` for velocity profiles, computes zone crossings, schedules timed SPI register writes (same level as `kin_shaper.c`)
 3. **MCU firmware** — existing `spi_transfer` command handles timed SPI writes to TMC5160; untouched
 
-The core insight: Klipper's motion planner works ahead of real time. The full velocity profile is known before execution, so DCC pre-computes and pre-schedules all TMC register changes.
+### How Phase 1 hooks into the motion pipeline
 
-### Key Components (all NEW)
+- Monkey-patches `toolhead.lookahead.add_move()` to append a `timing_callback` to every kinematic move
+- The callback fires inside `ToolHead._process_moves()` AFTER `set_junction()` has populated the velocity profile (`start_v`, `cruise_v`, `end_v`, `accel_t`, `cruise_t`, `decel_t`)
+- Callback receives `next_move_time` (end time of the move in print_time coordinates)
+- Zone crossings are calculated from the trapezoidal velocity profile and timed SPI writes scheduled via `MCU_TMC_SPI.set_register(reg_name, val, print_time)`
 
-- **dcc_solver** — iterates trapq moves, identifies velocity zone boundary crossings, maps to chopper profiles
-- **spi_schedule** — queues timed SPI register writes into the MCU command queue alongside step commands
-- **dynamic_chopper.py** — Python config module, profile management, move handler registration
+### Key Components
+
+- **`dynamic_chopper.py`** (Phase 1, exists) — Python config module, move interception, zone crossing calculation, timed SPI scheduling
+- **`dcc_solver`** (Phase 2, planned) — C implementation of velocity analysis for deterministic timing
+- **`spi_schedule`** (Phase 2, planned) — C-level queuing of timed SPI writes
 
 ### Velocity Zone Model
 
-Discrete velocity zones, each carrying a full register snapshot (CHOPCONF + PWMCONF + GCONF + current scaling). Special reversal profile for direction changes (reduced current, wider hysteresis, slower decay). See `docs/design.md` sections 4 and 8 for details.
+Discrete velocity zones, each carrying pre-computed register values (CHOPCONF + PWMCONF + GCONF). Special reversal profile for direction changes (wider hysteresis, slower decay). See `docs/design.md` sections 4 and 8.
 
-## Kalico Source Files to Understand
+## Kalico Source Files Reference
 
-Before implementing, read these from a Kalico checkout:
-- `klippy/chelper/trapq.h` / `trapq.c` — `struct move` with velocity data (`start_v`, `half_accel`, `cruise_v`, `move_t`, `print_time`)
-- `klippy/chelper/input_shaper.c` — reference pattern for hooking into the motion pipeline
-- `klippy/extras/tmc.py` — `TMCCommandHelper`, `set_register(reg_name, value, print_time)` for timed writes
-- `klippy/extras/tmc5160.py` — TMC5160 register definitions, `MCU_TMC_SPI`
-- `src/spicmds.c` — MCU-side timed SPI command handling
-- `klippy/chelper/stepcompress.c` — how timed commands are queued to MCU
+Verified file paths in `KalicoCrew/kalico`:
+- `klippy/chelper/trapq.h` / `trapq.c` — `struct move` with `start_v`, `half_accel`, `move_t`, `print_time` (no `cruise_v` in C struct; derived from start_v + accel * accel_t)
+- `klippy/chelper/kin_shaper.c` — C-level reference for hooking into kinematics (NOT `input_shaper.c` which doesn't exist)
+- `klippy/extras/input_shaper.py` — Python-level shaper; uses `chelper.get_ffi()` and `stepper_kinematics` wrapping
+- `klippy/extras/tmc.py` — `TMCCommandHelper`, `FieldHelper`, `set_register(reg_name, val, print_time)`
+- `klippy/extras/tmc5160.py` — register definitions, field masks, `TMC5160CurrentHelper`
+- `klippy/extras/tmc2130.py` — `MCU_TMC_SPI` class, `MCU_TMC_SPI_chain.reg_write()` with `minclock`
+- `klippy/toolhead.py` — `Move` class, `LookAheadQueue`, `_process_moves()`, `register_lookahead_callback()`
+
+**Important API notes:**
+- Kalico has NO `register_move_handler()` — use `timing_callbacks` on `Move` objects or `register_lookahead_callback()`
+- `register_lookahead_callback()` only hooks the LAST queued move, not all moves
+- Timed SPI writes use `minclock` (minimum MCU clock for execution), converted from `print_time` via `mcu.print_time_to_clock()`
 
 ## Implementation Phases
 
-1. **Phase 1: Python prototype** — `klippy/extras/dynamic_chopper.py`, uses `toolhead.register_move_handler()`, calls `set_register()` with `print_time`. Accepts timing jitter.
+1. **Phase 1: Python prototype** (done) — `klippy/extras/dynamic_chopper.py`, hooks `add_move`, calls `set_register()` with `print_time`. Accepts Python-level timing jitter.
 2. **Phase 2: C chelper** — `klippy/chelper/dcc.c`, deterministic sub-microsecond timing, CFFI wrapper for Python config layer.
 3. **Phase 3: Tuning tooling** — auto-sweep with accelerometer feedback, profile recording, reversal tuning macros.
 
